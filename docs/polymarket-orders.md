@@ -15,44 +15,102 @@
 
 ## Placing Orders
 
+> ⚠️ Snippets rewritten **2026-08-06** against the official docs and PyPI.
+> `py-clob-client` (no suffix) is **archived and non-functional** — anything
+> importing `py_clob_client` is dead code. Two current Python packages:
+> `polymarket-client` (unified SDK, what the docs use) and `py-clob-client-v2`
+> (CLOB only). See [SDKs](polymarket-api.md#sdks--client-libraries).
+
 ### GTC Buy Order
 
-The most common order type for market making:
+The most common order type for market making. `price` and `size` are **strings**
+in the unified SDK:
 
 ```python
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+import os
+from polymarket import SecureClient
 
-client = ClobClient(
-    host="https://clob.polymarket.com",
-    chain_id=137,
-    key="YOUR_PRIVATE_KEY",
-    signature_type=0,
-)
-client.set_api_creds(client.create_or_derive_api_creds())
+with SecureClient.create(
+    private_key=os.environ["POLYMARKET_PRIVATE_KEY"],
+    wallet=os.environ["POLYMARKET_WALLET_ADDRESS"],
+) as client:
+    # Limit buy at $0.48 for 100 shares. GTC is the default lifetime.
+    response = client.place_limit_order(
+        token_id="TOKEN_ID_HERE",
+        side="BUY",
+        price="0.48",
+        size="100",
+    )
 
-# Place a limit buy at $0.48 for 100 shares
-order_args = OrderArgs(
-    price=0.48,
-    size=100.0,
-    side="BUY",
-    token_id="TOKEN_ID_HERE",
-)
-signed_order = client.create_order(order_args)
-resp = client.post_order(signed_order, OrderType.GTC)
-
-print(f"Order ID: {resp['orderID']}")
-print(f"Status: {resp['status']}")  # LIVE or MATCHED
+    if response.ok:
+        print(response.order_id, response.status)
+    else:
+        print(response.code, response.message)
 ```
+
+Same order through the CLOB-only client, where price/size are numbers and the
+order type is explicit:
+
+```python
+from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions, Side
+
+resp = client.create_and_post_order(
+    order_args=OrderArgs(token_id="TOKEN_ID_HERE", price=0.48, side=Side.BUY, size=100),
+    options=PartialCreateOrderOptions(tick_size="0.01"),
+    order_type=OrderType.GTC,
+)
+```
+
+### Order Response
+
+```python
+{
+    "ok": bool,
+    "order_id": str,
+    "status": str,           # "live" | "matched" | "delayed" | "unmatched"
+    "making_amount": str,
+    "taking_amount": str,
+    "trade_ids": list,
+    "transactions_hashes": list,
+}
+```
+
+Since **2026-07-17**, FAK/FOK matches return `trade_ids` and **no longer return
+`transactions_hashes`** — code that keyed fills on the transaction hash from this
+response has nothing to key on.
+
+### Market Orders
+
+Market orders need a price estimate first, and take `amount` (USDC) when buying
+or `shares` when selling:
+
+```python
+estimated_buy_price = client.estimate_market_price(
+    token_id=yes_token_id, side="BUY", amount="10", order_type="FAK",
+)
+response = client.place_market_order(
+    token_id=yes_token_id, side="BUY", amount="10",
+    max_price=estimated_buy_price, order_type="FAK",
+)
+```
+
+Selling uses `shares=` and `min_price=` instead.
 
 ### Important Parameters
 
 | Parameter | Notes |
 |-----------|-------|
-| `price` | Must align with tick size (0.01 or 0.001) |
+| `price` | Must align with tick size (0.01 or 0.001). String in the unified SDK, float in the CLOB client |
 | `size` | Minimum order size varies by market (typically 5+) |
 | `side` | `"BUY"` or `"SELL"` |
 | `token_id` | The specific outcome token to trade |
+| `post_only` | `True` rejects the order if it would match immediately (guarantees maker) |
+| `builder_code` | Credits the trade to your builder profile — replaces the removed `POLY_BUILDER_*` headers |
+
+Batch: `post_orders()` accepts **1–15** signed orders per call.
+
+**GTD expires one minute before the time you set** (security threshold), so the
+expiration must be at least 3 minutes in the future.
 
 ---
 

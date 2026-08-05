@@ -29,7 +29,15 @@ Polymarket provides four WebSocket channels:
 | **Market** | `wss://ws-subscriptions-clob.polymarket.com/ws/market` | No | Order book snapshots, price changes, market events |
 | **User** | `wss://ws-subscriptions-clob.polymarket.com/ws/user` | Yes | Your order fills, placements, cancellations |
 | **Sports** | `wss://sports-api.polymarket.com/ws` | No | Live sports scores and game state |
-| **RTDS** | `wss://ws-live-data.polymarket.com` | Optional | Real-time comments and crypto prices |
+| **RTDS** | `wss://ws-live-data.polymarket.com` | Optional | Real-time comments and crypto/equity prices |
+
+> **RTDS documents four topics only**: `crypto_prices`, `crypto_prices_chainlink`,
+> `equity_prices`, `comments`. An `activity`/`trades` topic carrying
+> platform-wide fills for arbitrary wallets **does** respond on this socket but
+> is **not** in the published reference — no contract, no sequence numbers, no
+> replay, no backfill. Usable, but treat it as unsupported and monitor delivery
+> rather than connection state. **No documented channel exposes wallet addresses
+> for arbitrary traders**: the market channel carries no wallet data at all.
 
 ---
 
@@ -135,6 +143,12 @@ Emitted when a new order is placed or cancelled. A `size` of `"0"` means the pri
   "timestamp": "1750428146322"
 }
 ```
+
+> ⚠️ **`fee_rate_bps` here is a CLOB V1 leftover — ignore it.** V2 removed
+> `feeRateBps` from the order struct and sets the fee at match time, so this
+> field reads `0` regardless of what a taker actually pays. For the real number
+> use `GET /clob-markets/{condition_id}` (`fd.r`, `fd.e`, `tbf`). See
+> [pitfalls #10](pitfalls.md#10-assuming-fees-are-zero).
 
 ### Market Resolved Event (Custom Feature)
 

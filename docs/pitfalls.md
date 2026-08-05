@@ -309,9 +309,67 @@ The CLOB matching engine periodically restarts. During restarts:
 
 ---
 
-## 10. Fee-Enabled Markets
+## 10. Assuming Fees Are Zero
 
-Since Jan-Feb 2026, some markets charge taker fees (5-min crypto, 15-min crypto, NCAAB, Serie A). If you don't include `feeRateBps` in your signed order, it will be rejected on fee-enabled markets. The SDKs handle this automatically — if using REST directly, always query `/fee-rate` first.
+> ⚠️ Rewritten 2026-08-06. The previous version of this section said fees applied
+> to "some markets (5-min crypto, 15-min crypto, NCAAB, Serie A)" and told you to
+> put `feeRateBps` in the order. Both statements are now wrong.
+
+### The Mistake
+
+Concluding that a market charges no fee because a field said `0`.
+
+Two fields invite this. A live `last_trade_price` WebSocket event carries
+`fee_rate_bps: "0"`, and older CLOB market objects report `maker_base_fee` /
+`taker_base_fee` = `1000` on every market. It is tempting to treat the `1000` as
+an unapplied default and the `0` as the measurement.
+
+### Why It's Wrong
+
+`feeRateBps` is a **CLOB V1** field. V2 removed it from the signed order struct
+entirely because the protocol now determines the fee **at match time**. A zero
+there describes a retired mechanism, not what you will pay.
+
+Since the 2026-03-30 fee structure, **most categories charge takers** — only
+Geopolitics is free — at 0.04–0.07 depending on category.
+
+### What It Costs
+
+`fee = shares × rate × p × (1 − p)`, which against money staked is
+`rate × (1 − p)`:
+
+| Entry price | Cost at rate 0.05 |
+|-------------|------------------:|
+| 0.15 | **425 bps of stake** |
+| 0.50 | **250 bps** |
+| 0.85 | **75 bps** |
+
+If your edge is measured in basis points, a wrong fee assumption can be larger
+than the entire edge — and it is worst at the longshot end, where thin edges
+usually live.
+
+### The Fix
+
+```python
+# Per market, from CLOB. mbf/tbf = maker/taker base fee (bps),
+# fd = {r: rate, e: exponent, to: taker-only}
+info = httpx.get(f"https://clob.polymarket.com/clob-markets/{condition_id}").json()
+rate = (info.get("fd") or {}).get("r")
+exponent = (info.get("fd") or {}).get("e", 1)
+
+if rate is None:
+    raise ValueError("no fee data — do NOT treat this as a zero fee")
+
+fee = shares * rate * (price * (1 - price)) ** exponent
+```
+
+### Rules
+
+1. **NEVER** read a missing or unknown fee as a zero fee — they are different states
+2. **NEVER** derive "fee-free" from one field; `tbf` can be 0 while `fd.r` is live
+3. Makers pay nothing, but maker **rebates** are paid daily under program terms,
+   not per fill — never credit them to a simulated fill
+4. Rates change (sports went 0.03 → 0.05 on 2026-07-10) — fetch, don't hardcode
 
 ---
 
