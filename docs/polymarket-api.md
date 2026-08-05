@@ -2,6 +2,15 @@
 
 > Complete reference for all three Polymarket APIs: Gamma, Data, and CLOB.
 
+> ⚠️ **CLOB V2 since 2026-04-28 — no V1 compatibility.** This page was written
+> in Feb 2026 and re-verified against the official docs on **2026-08-06**:
+> endpoint tables, fee section, Data API parameters, order payload, error codes
+> and all Python snippets.
+>
+> **`py-clob-client` is archived and non-functional** — its repository states it
+> "should not be used for new or existing integrations". Every snippet on this
+> page now uses the current official SDK; see [SDKs](#sdks--client-libraries).
+
 ## Table of Contents
 
 - [Three APIs Overview](#three-apis-overview)
@@ -85,16 +94,33 @@ The HMAC signature is computed over `timestamp + method + path + body` using you
 
 ### Creating API Credentials
 
-```python
-from py_clob_client.client import ClobClient
+With the unified SDK, credential derivation happens inside `create()` — you
+never handle the L2 creds yourself:
 
-client = ClobClient(
-    host="https://clob.polymarket.com",
-    chain_id=137,
-    key="YOUR_PRIVATE_KEY",
-)
-creds = client.create_or_derive_api_creds()
-# Returns: { apiKey, secret, passphrase }
+```python
+import os
+from polymarket import SecureClient
+
+with SecureClient.create(
+    private_key=os.environ["POLYMARKET_PRIVATE_KEY"],
+    wallet=os.environ["POLYMARKET_WALLET_ADDRESS"],
+) as client:
+    ...
+```
+
+With the CLOB-only client the two steps are explicit — note it is
+`create_or_derive_api_key()`, singular:
+
+```python
+import os
+from py_clob_client_v2 import ClobClient
+
+# L1: derive credentials from the wallet
+client = ClobClient(host=host, chain_id=chain_id, key=os.environ["PK"])
+creds = client.create_or_derive_api_key()
+
+# L1 + L2: fully authenticated client
+client = ClobClient(host=host, chain_id=chain_id, key=os.environ["PK"], creds=creds)
 ```
 
 ### REST API Key Endpoints
@@ -178,14 +204,61 @@ Base: `https://data-api.polymarket.com`
 | `/positions?market={condition_id}` | GET | Positions for a market |
 | `/top-holders?market={condition_id}` | GET | Top holders for a market |
 | `/portfolio-value?user={address}` | GET | Total value of user's positions |
-| `/trades?user={address}` | GET | Trades for a user |
+| `/trades?user={address}` | GET | Trades for a user — **see the `takerOnly` trap below** |
 | `/trades?market={condition_id}` | GET | Trades for a market |
-| `/activity?user={address}` | GET | User activity |
-| `/leaderboard` | GET | Trader leaderboard rankings |
+| `/activity?user={address}` | GET | User activity (incl. SPLIT / MERGE / REDEEM / CONVERSION) |
+| `/v1/leaderboard` | GET | Trader leaderboard rankings — **see `timePeriod` below** |
 | `/open-interest?market={condition_id}` | GET | Open interest for a market |
 | `/volume?event_id={id}` | GET | Live volume for an event |
 | `/total-markets-traded?user={address}` | GET | Total markets a user has traded |
 | `/accounting-snapshot?user={address}` | GET | Download ZIP of CSV accounting data |
+
+### ⚠️ Two defaults that silently corrupt research samples
+
+Both verified 2026-08-06. Both have already produced months of wrong data.
+
+**`GET /trades` defaults to `takerOnly=true`.** Omit the parameter and you get
+only the fills where the wallet *crossed the spread* — for a liquidity provider
+that is not a sample of their trading, it is a sample of one side of it. Always
+send it explicitly:
+
+```
+GET /trades?user=0x…&takerOnly=false&limit=500&offset=0&start=…&end=…
+```
+
+| Param | Default | Limit |
+|-------|---------|-------|
+| `takerOnly` | **`true`** | — |
+| `limit` | 100 | max 10,000 |
+| `offset` | 0 | **max 10,000 — beyond returns 400, not an empty page** |
+| `start` / `end` | ~3-year window | epoch **seconds** |
+| `side`, `market`, `eventId`, `filterType`+`filterAmount` | — | `market` and `eventId` are mutually exclusive |
+
+The response has **no maker/taker role field** — once both are included you
+cannot tell which a given fill was. `side` is BUY/SELL, not role. Fields:
+`proxyWallet`, `side`, `asset`, `conditionId`, `size`, `price`, `timestamp`,
+`title`, `slug`, `eventSlug`, `outcome`, `outcomeIndex`, `transactionHash`.
+
+**`GET /v1/leaderboard` has no `window` parameter.** The parameter is
+`timePeriod`, uppercase, and it defaults to `DAY`. Sending `window=month` is
+silently ignored and you get the *daily* board — which looks like a working
+query and ranks on the noisiest surface the API offers.
+
+| Param | Values | Default |
+|-------|--------|---------|
+| `timePeriod` | `DAY` \| `WEEK` \| `MONTH` \| `ALL` | **`DAY`** |
+| `category` | `OVERALL`, `POLITICS`, `SPORTS`, `ESPORTS`, `CRYPTO`, `CULTURE`, `MENTIONS`, `WEATHER`, `ECONOMICS`, `TECH`, `FINANCE` | `OVERALL` |
+| `orderBy` | `PNL` \| `VOL` | `PNL` |
+| `limit` | 1–50 | 25 |
+| `offset` | 0–**1000** | 0 |
+
+Response rows: `rank`, `proxyWallet`, `userName`, `vol`, `pnl`, `profileImage`,
+`xUsername`, `verifiedBadge`. With `limit ≤ 50` and `offset ≤ 1000`, a single
+period tops out around 1,050 rows.
+
+**General rule both cases share:** an unknown query parameter is *ignored*, not
+rejected. The server answers with its own default and the response looks
+perfectly healthy. If a filter matters, assert that it was applied.
 
 ### Builder Endpoints
 
@@ -216,6 +289,7 @@ Base: `https://clob.polymarket.com`
 | `/last-trade-prices` | GET/POST | Batch last trade prices (max 500) |
 | `/tick-size?token_id={id}` | GET | Minimum tick size |
 | `/tick-size/{token_id}` | GET | Tick size (path parameter) |
+| `/clob-markets/{condition_id}` | GET | **All CLOB params for a market in one call** — tokens, tick size, `mbf`/`tbf` base fees, `fd` fee curve, rewards, RFQ |
 | `/fee-rate?token_id={id}` | GET | Fee rate for a token |
 | `/fee-rate/{token_id}` | GET | Fee rate (path parameter) |
 | `/prices-history` | GET | Historical price data |
@@ -240,19 +314,26 @@ Base: `https://clob.polymarket.com`
 
 #### POST /order — Place Single Order
 
+> ⚠️ **The payload below is the CLOB V1 order struct and no longer works.** V2
+> (live 2026-04-28) **removed** `nonce`, `feeRateBps` and `taker` from the signed
+> order and **added** `timestamp` (ms, provides uniqueness), `metadata` and
+> `builder`. EIP-712 domain version went `1` → `2` with a new `verifyingContract`.
+> A V1-signed order is rejected — typically as `invalid fee rate (0)`.
+> See [migration_to_v2.md](migration_to_v2.md).
+
 ```json
 {
   "order": {
     "salt": 12345678,
     "maker": "0xYOUR_WALLET",
     "signer": "0xYOUR_WALLET",
-    "taker": "0x0000...0000",
     "tokenId": "12345...",
     "makerAmount": "50000000",
     "takerAmount": "100000000",
     "expiration": "0",
-    "nonce": "0",
-    "feeRateBps": "0",
+    "timestamp": "1777374000000",
+    "metadata": "0x00...",
+    "builder": "0x00...",
     "side": "BUY",
     "signatureType": 0,
     "signature": "0x..."
@@ -337,32 +418,77 @@ neg_risk = resp["neg_risk"]            # True or False
 
 ## Fee Rates
 
-### Fee-Free Markets (Most Markets)
+> ⚠️ Rewritten **2026-08-06** against <https://docs.polymarket.com/trading/fees>.
+> The previous version of this section described the Jan–Feb 2026 rollout, when
+> fees applied only to a handful of market types. That has not been true since
+> the **2026-03-30 fee structure V2**: most categories now charge takers.
 
-No trading fees. No deposit/withdrawal fees from Polymarket (intermediaries may charge).
+### Which markets charge fees
 
-### Markets With Taker Fees
+**Most of them.** Fees are per *category*, and only **Geopolitics** is fee-free.
+Do not assume a market is free — read its parameters (below).
 
-- **5-minute crypto markets**
-- **15-minute crypto markets**
-- **NCAAB (college basketball) markets** (from Feb 18, 2026)
-- **Serie A markets** (from Feb 18, 2026)
+| Category | Taker rate | Maker rebate |
+|----------|-----------:|-------------:|
+| Crypto | 0.07 | 20% |
+| Sports | 0.05 | 15% |
+| Economics, Culture, Weather, Other | 0.05 | 25% |
+| Finance, Politics, Mentions, Tech | 0.04 | 25% |
+| **Geopolitics** | **0** | — |
 
-### Fee Formula
+Sports moved from 0.03 → 0.05 (rebate 25% → 15%) on **2026-07-10**. Rates change;
+treat this table as a fallback, not as the source of truth.
+
+### Fee formula
 
 ```
-fee = C × feeRate × (p × (1 - p))^exponent
+fee = C × feeRate × p × (1 - p)        # C = shares traded, p = price, in USDC
 ```
 
-| Parameter | Sports (NCAAB, Serie A) | 5-Min & 15-Min Crypto |
-|-----------|------------------------|----------------------|
-| Fee Rate | 0.0175 | 0.25 |
-| Exponent | 1 | 2 |
-| Maker Rebate % | 25% | 20% |
+- **Makers are never charged.** Only takers pay. Maker rebates are paid daily
+  under program terms, *not* per fill — do not credit them to a simulated fill.
+- The fee is charged **in USDC for both buys and sells**.
+- Rounded to 5 decimal places; the smallest fee charged is `0.00001 USDC`.
+- Symmetric about p=0.5, so 30¢ and 70¢ cost the same in dollars.
 
-**Peak effective rate**: 1.56% at p=0.50 for crypto; 0.44% at p=0.50 for sports. Fees are rounded to 4 decimal places.
+**As a share of money staked** the fee is `feeRate × (1 − p)` — monotonically
+worse the cheaper the contract, which is the part that surprises people:
 
-SDKs automatically fetch and include `feeRateBps` in signed orders. If using REST directly, query `/fee-rate` first.
+| Entry price | Cost at rate 0.05 |
+|-------------|------------------:|
+| 0.15 | **425 bps of stake** |
+| 0.50 | **250 bps** |
+| 0.85 | **75 bps** |
+
+For anything priced in basis points of capital, that is a first-order term, not
+a rounding detail.
+
+### Reading the real parameters per market
+
+```
+GET https://clob.polymarket.com/clob-markets/{condition_id}
+```
+
+Abbreviated keys: `mbf` maker base fee (bps), `tbf` taker base fee (bps), and
+`fd` = { `r` rate, `e` curve exponent, `to` taker-only }. The published formula
+above has no exponent term (i.e. `e = 1`), but `fd.e` is authoritative per
+market and has carried other values — read it, don't assume it.
+
+```json
+{ "mos": 5, "mts": 0.01, "mbf": 0, "tbf": 500,
+  "fd": { "r": 0.05, "e": 1, "to": true } }
+```
+
+`mbf`/`tbf` can read `0` while `fd.r` is live, so **do not derive "fee-free"
+from a single field** — check both.
+
+### ⚠️ `feeRateBps` is a V1 field and means nothing now
+
+CLOB V2 removed `feeRateBps` from the signed order struct entirely; the protocol
+sets the fee at match time. A `fee_rate_bps: "0"` seen on a WebSocket event, or a
+uniform `1000` on an old market object, is a vestige of the retired mechanism —
+**neither is evidence that a market is fee-free**. Reading a zero there as "fees
+are zero" is a mistake that has already been made in production.
 
 ## Rate Limits
 
@@ -443,7 +569,8 @@ All errors return `{"error": "<message>"}`.
 | 400 | `invalid post-only order: order crosses book` | Post-only order would match immediately |
 | 400 | `Price breaks minimum tick size rule` | Price doesn't align with tick size |
 | 400 | `Size lower than the minimum` | Order too small |
-| 400 | `not enough balance / allowance` | Insufficient USDC.e or token allowance |
+| 400 | `not enough balance / allowance` | Insufficient **pUSD** or token allowance (holding unwrapped USDC counts as zero) |
+| 400 | `invalid fee rate (0)` | V1 `feeRateBps` sent on a V2 order — see [migration_to_v2.md](migration_to_v2.md) |
 | 400 | `invalid nonce` | Nonce already used |
 | 400 | `FOK orders are fully filled or killed` | FOK couldn't be completely filled |
 | 400 | `no orders found to match with FAK order` | FAK found zero matches |
@@ -455,13 +582,29 @@ All errors return `{"error": "<message>"}`.
 
 ### Official SDKs
 
-| Language | Package | Repository |
-|----------|---------|------------|
-| TypeScript | `@polymarket/clob-client` | [github.com/Polymarket/clob-client](https://github.com/Polymarket/clob-client) |
-| Python | `py-clob-client` | [github.com/Polymarket/py-clob-client](https://github.com/Polymarket/py-clob-client) |
-| Rust | `polymarket-client-sdk` | [github.com/Polymarket/rs-clob-client](https://github.com/Polymarket/rs-clob-client) |
+Verified against PyPI and the official docs on **2026-08-06**. There are two
+current Python packages and they are not interchangeable.
+
+| Package | What it is | Version | Python | Use when |
+|---------|-----------|---------|--------|----------|
+| **`polymarket-client`** | Official **unified** SDK ([Polymarket/py-sdk](https://github.com/Polymarket/py-sdk)) — public data, auth, trading, builder attribution, wallet/gasless flows | 0.3.0 (2026-08-04) | ≥3.11 | default; this is what the docs' own quickstart uses |
+| **`py-clob-client-v2`** | CLOB **V2 only** client, by Polymarket Engineering | 1.1.0 (2026-07-17) | ≥3.9.10 | you only need the order book and order placement, or you are on Python 3.9/3.10 |
+| ~~`py-clob-client`~~ | **ARCHIVED — non-functional** | — | — | never |
+| TypeScript | `@polymarket/client` | — | — | TS equivalent of the unified SDK |
+
+> `polymarket-client` is pre-1.0 and its own README warns that **minor releases
+> on the 0.x line may include breaking changes**. Pin the version.
+
+The archived repo's own notice: it "has been archived and is no longer
+maintained. The client is no longer functional and should not be used for new or
+existing integrations." If a snippet anywhere imports `py_clob_client` (no
+suffix), it is dead code.
 
 ### Builder SDKs (for Builder Program apps)
+
+Note: V2 replaced the `POLY_BUILDER_*` headers with a `builder` field in the
+order payload, and the unified SDK exposes it as a `builder_code` argument on
+order calls — so a separate signing SDK may no longer be needed.
 
 | Language | Package |
 |----------|---------|
@@ -477,24 +620,64 @@ All errors return `{"error": "<message>"}`.
 
 ### Python Quick Start
 
+**Unified SDK — `pip install polymarket-client`**
+
+Read-only needs no credentials at all:
+
 ```python
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from polymarket import Market, PublicClient
 
-client = ClobClient(
-    host="https://clob.polymarket.com",
-    chain_id=137,
-    key="YOUR_PRIVATE_KEY",
-    signature_type=2,  # GNOSIS_SAFE
-    funder="YOUR_PROXY_WALLET",
+with PublicClient() as client:
+    market: Market = client.get_market(url="https://polymarket.com/event/example-market")
+```
+
+Trading. Note `price` and `size` are **strings**, and the client is a context
+manager — `AsyncSecureClient` mirrors this with `async with` / `await`:
+
+```python
+import os
+from polymarket import SecureClient
+
+with SecureClient.create(
+    private_key=os.environ["POLYMARKET_PRIVATE_KEY"],
+    wallet=os.environ["POLYMARKET_WALLET_ADDRESS"],
+) as client:
+    response = client.place_limit_order(
+        token_id=yes_token_id,
+        side="BUY",
+        price="0.52",
+        size="10",
+    )
+    if response.ok:
+        print(response.order_id, response.status)   # live | matched | delayed | unmatched
+    else:
+        print(response.code, response.message)
+```
+
+**CLOB-only SDK — `pip install py-clob-client-v2`**
+
+Still takes `host` / `chain_id` / `key` positionally-named, unlike the TypeScript
+V2 client which moved to an object config:
+
+```python
+import os
+from py_clob_client_v2 import (
+    ClobClient, OrderArgs, OrderType, PartialCreateOrderOptions, Side,
 )
-creds = client.create_or_derive_api_creds()
-client.set_api_creds(creds)
 
-# Place order
+client = ClobClient(host=host, chain_id=chain_id, key=os.environ["PK"])
+creds = client.create_or_derive_api_key()
+client = ClobClient(host=host, chain_id=chain_id, key=os.environ["PK"], creds=creds)
+
 resp = client.create_and_post_order(
-    OrderArgs(price=0.50, size=10, side="BUY", token_id="TOKEN_ID"),
-    options={"tick_size": "0.01", "neg_risk": False}
+    order_args=OrderArgs(
+        token_id="",
+        price=0.4,
+        side=Side.BUY,
+        size=100,
+    ),
+    options=PartialCreateOrderOptions(tick_size="0.01"),
+    order_type=OrderType.GTC,
 )
 ```
 
