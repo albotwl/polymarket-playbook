@@ -167,7 +167,7 @@ Base: `https://gamma-api.polymarket.com`
 | `/tags/{id}/related` | GET | Get related tags |
 | `/series` | GET | List series |
 | `/series/{id}` | GET | Get series by ID |
-| `/public-search?query=...` | GET | Search markets, events, profiles |
+| `/public-search?q=...` | GET | Search markets, events, profiles — the param is **`q`**, see below |
 
 ### Comments & Profiles
 
@@ -185,11 +185,75 @@ Base: `https://gamma-api.polymarket.com`
 | `/sports/market-types` | GET | Valid sports market types |
 | `/sports/teams` | GET | List teams |
 
+### ⚠️ Gamma traps verified 2026-08-11
+
+Six behaviours that differ from what the endpoint tables imply. Each was hit in
+a real study and each cost time or corrupted a sample before it was found.
+
+**`/public-search` takes `q`, not `query`.** Sending `query=` returns
+HTTP 422 `{"type":"validation error","error":"query argument \"q\": empty"}` —
+the message names the parameter it wanted, which is easy to misread as a
+complaint about the value you sent.
+
+**`closed_time_min` / `closed_time_max` are recognised but return HTTP 500.**
+There is no way to filter by resolution time. To enumerate markets that
+*resolved* in a window: page `end_date_min`/`end_date_max` and post-filter on
+`closedTime` client-side, widening the endDate scan on both sides — measured
+`|closedTime − endDate| > 2 days` for ~33% of markets, extremes 217 days early
+and 57 days late. A widened scan is not optional padding: at full scale 11.5% of
+one 180-day frame came from the widening bands, and those are exactly the
+early- and late-resolvers.
+
+**`closedTime` is not ISO-8601.** Format is `YYYY-MM-DD HH:MM:SS+00` (space, no
+`T`, two-digit offset) while `endDate`, `startDate` and `updatedAt` are ISO-Z.
+Normalise before comparing or the comparison silently fails.
+
+**Pagination caps are silent.** `limit` is capped at 100 without an error
+(`limit=500` returns 100 rows). `offset` works to 2000 and returns HTTP 422 at
+~2125 pointing at `/markets/keyset`. A binary search on `offset` measures the
+cap, not the row count.
+
+**There is no `category` field.** Not on markets, not on embedded events —
+verified across 800 sampled markets. Tags are the only category signal: either
+`GET /markets/{id}/tags` per market, or enumerate `/events`, which embeds both
+`tags[]` and `markets[]` and has a higher rate limit (500 vs 300 per 10s).
+
+**Market text mutates after resolution.** `updatedAt > closedTime` on 800/800
+sampled resolved markets. Treat `description` as untrusted for any
+point-in-time analysis; `question` and event `title` are safer but not verified
+immutable — snapshot the text you use and record `updatedAt` alongside it.
+
 ### Prices History
 
 ```
-GET https://gamma-api.polymarket.com/markets/{condition_id}/prices-history?interval=max&fidelity=60
+GET https://clob.polymarket.com/prices-history?market={token_id}&startTs={s}&endTs={e}&fidelity=1
 ```
+
+**`interval=max` is a trap.** It silently ignores `fidelity` below 10 (serving
+600-second bars when you asked for 60), and for markets that closed more than
+~31–33 days ago it returns `{"history":[]}` — which reads as "data was purged"
+when the data is in fact still there and reachable through explicit timestamps.
+
+Verified behaviour with `startTs`/`endTs` (measured 2026-08-11 on 8 resolved
+markets, ages 13 days to 6 months, volumes $5k–$99k):
+
+- **1-minute history persists at least 6 months after resolution**, including
+  $5k long-tail markets. 1 minute is the floor — `fidelity=0` still returns a
+  60-second grid.
+- The window has a **maximum span between 15 and 21 days**: 15 days succeeds,
+  21 and 30 return HTTP 400
+  `{"error":"invalid filters: 'startTs' and 'endTs' interval is too long"}`.
+  The limit is fidelity-independent, so page in ≤15-day chunks.
+- No points-per-response cap was found — single responses of 20,155 and 21,594
+  points returned complete.
+- The series is **carry-forward**: a point exists every 60 seconds even in
+  minutes with no trade, so "the price at t" can be a stale print from hours
+  earlier. It is trade-price only — there is no bid/ask, spread or depth
+  history anywhere. For anything execution-related use Data API `/trades`
+  prints instead, which are retained for the same horizon and carry real
+  timestamps and sizes.
+- Active markets expose `bestBid`/`bestAsk` directly on the Gamma market object,
+  so a live quote needs no CLOB call at all.
 
 ---
 
